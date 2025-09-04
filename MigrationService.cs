@@ -3,6 +3,7 @@ using MongoDB.Driver;
 using Npgsql;
 using NpgsqlTypes;
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 
@@ -12,6 +13,9 @@ namespace MongoToPostgresMigration
     {
         private readonly IMongoDatabase _mongoDb;
         private readonly string _postgresConnection;
+
+        // Track discovered relationships for ERD printing
+        private readonly List<(string Parent, string Child)> _relationships = new();
 
         public MigrationService(string mongoConnection, string mongoDbName, string postgresConnection)
         {
@@ -30,6 +34,8 @@ namespace MongoToPostgresMigration
                 Console.WriteLine($"Migrating collection: {collectionName}");
                 await MigrateCollectionAsync(collectionName);
             }
+
+            PrintERD();
         }
 
         private async Task MigrateCollectionAsync(string collectionName)
@@ -48,36 +54,34 @@ namespace MongoToPostgresMigration
 
             var rootTable = GetTableName(collectionName);
 
-            // 1. Schema discovery (ensures all tables/columns exist)
             foreach (var doc in documents)
             {
                 await DiscoverSchemaAndCreateTablesAsync(conn, rootTable, doc, null);
             }
 
-            // 2. Insert data
             foreach (var doc in documents)
             {
                 await InsertDocumentAsync(conn, rootTable, doc, null, null);
             }
         }
 
-        // 🔍 Schema discovery (recursive)
         private async Task DiscoverSchemaAndCreateTablesAsync(NpgsqlConnection conn, string tableName, BsonDocument doc, string? parentTable)
         {
-            // Create base table
             string createSql = $@"CREATE TABLE IF NOT EXISTS ""{tableName}"" (
                 Id SERIAL PRIMARY KEY
             );";
             using (var cmd = new NpgsqlCommand(createSql, conn))
                 await cmd.ExecuteNonQueryAsync();
 
-            // Add ParentId if child
             if (parentTable != null)
             {
                 string parentColSql = $@"ALTER TABLE ""{tableName}""
                              ADD COLUMN IF NOT EXISTS ""ParentId"" INTEGER REFERENCES ""{parentTable}""(Id);";
                 using var parentCmd = new NpgsqlCommand(parentColSql, conn);
                 await parentCmd.ExecuteNonQueryAsync();
+
+                // Track relationship for ERD
+                _relationships.Add((parentTable, tableName));
             }
 
             foreach (var element in doc.Elements)
@@ -116,10 +120,8 @@ namespace MongoToPostgresMigration
             }
         }
 
-        // 📝 Insert documents (recursive with FK)
         private async Task InsertDocumentAsync(NpgsqlConnection conn, string tableName, BsonDocument doc, string? parentTable, int? parentId)
         {
-            // Scalars only
             var scalarElements = doc.Elements.Where(e => e.Value.BsonType != BsonType.Array && e.Value.BsonType != BsonType.Document).ToList();
             var scalarCols = scalarElements.Select(e => SanitizeColumnName(e.Name)).ToList();
 
@@ -156,7 +158,6 @@ namespace MongoToPostgresMigration
 
             var newId = (int)await cmd.ExecuteScalarAsync();
 
-            // Handle arrays + nested docs
             foreach (var element in doc.Elements)
             {
                 if (element.Value.BsonType == BsonType.Array)
@@ -188,7 +189,6 @@ namespace MongoToPostgresMigration
             }
         }
 
-        // 🏗️ Ensure scalar array tables exist
         private async Task EnsureScalarArrayTableExistsAsync(NpgsqlConnection conn, string tableName, string parentTable)
         {
             string createSql = $@"CREATE TABLE IF NOT EXISTS ""{tableName}"" (
@@ -206,9 +206,11 @@ namespace MongoToPostgresMigration
                             ADD COLUMN IF NOT EXISTS ""Value"" TEXT;";
             using var valueCmd = new NpgsqlCommand(valueColSql, conn);
             await valueCmd.ExecuteNonQueryAsync();
+
+            // Track ERD relation
+            _relationships.Add((parentTable, tableName));
         }
 
-        // 🛠 Helpers
         private string SanitizeColumnName(string name) =>
             name.Replace(".", "_").Replace(" ", "_").Replace("$", "dollar");
 
@@ -249,5 +251,22 @@ namespace MongoToPostgresMigration
                 },
                 _ => value.ToString()
             };
+
+        // 📊 Print ERD structure
+        private void PrintERD()
+        {
+            Console.WriteLine("\n Generated Table Relationships (ERD style):\n");
+
+            var grouped = _relationships.GroupBy(r => r.Parent);
+            foreach (var group in grouped)
+            {
+                Console.WriteLine(group.Key);
+                foreach (var child in group)
+                {
+                    Console.WriteLine($" └── {child.Child} (ParentId → {child.Parent}.Id)");
+                }
+                Console.WriteLine();
+            }
+        }
     }
 }
