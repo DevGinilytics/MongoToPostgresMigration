@@ -1,8 +1,8 @@
 ﻿using MongoDB.Bson;
 using MongoDB.Driver;
 using Npgsql;
+using NpgsqlTypes;
 using System;
-using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 
@@ -27,7 +27,7 @@ namespace MongoToPostgresMigration
 
             foreach (var collectionName in collections)
             {
-                Console.WriteLine($"📂 Migrating collection: {collectionName}");
+                Console.WriteLine($"Migrating collection: {collectionName}");
                 await MigrateCollectionAsync(collectionName);
             }
         }
@@ -39,32 +39,30 @@ namespace MongoToPostgresMigration
 
             if (documents.Count == 0)
             {
-                Console.WriteLine($"⚠️ No documents found in {collectionName}");
+                Console.WriteLine($"No documents found in {collectionName}");
                 return;
             }
 
             using var conn = new NpgsqlConnection(_postgresConnection);
             await conn.OpenAsync();
 
-            // -------------------------
-            // 1. Schema discovery
-            // -------------------------
+            var rootTable = GetTableName(collectionName);
+
+            // 1. Schema discovery (ensures all tables/columns exist)
             foreach (var doc in documents)
             {
-                await DiscoverSchemaAndCreateTablesAsync(conn, collectionName, doc, null);
+                await DiscoverSchemaAndCreateTablesAsync(conn, rootTable, doc, null);
             }
 
-            // -------------------------
-            // 2. Insert phase
-            // -------------------------
+            // 2. Insert data
             foreach (var doc in documents)
             {
-                await InsertDocumentAsync(conn, collectionName, doc, null);
+                await InsertDocumentAsync(conn, rootTable, doc, null, null);
             }
         }
 
-        // 🔍 Recursively discover schema and create tables
-        private async Task DiscoverSchemaAndCreateTablesAsync(NpgsqlConnection conn, string tableName, BsonDocument doc, string parentTable)
+        // 🔍 Schema discovery (recursive)
+        private async Task DiscoverSchemaAndCreateTablesAsync(NpgsqlConnection conn, string tableName, BsonDocument doc, string? parentTable)
         {
             // Create base table
             string createSql = $@"CREATE TABLE IF NOT EXISTS ""{tableName}"" (
@@ -76,69 +74,75 @@ namespace MongoToPostgresMigration
             // Add ParentId if child
             if (parentTable != null)
             {
-                string parentColSql = $@"ALTER TABLE ""{tableName}"" 
-                                         ADD COLUMN IF NOT EXISTS ""ParentId"" INTEGER REFERENCES ""{parentTable}""(Id);";
+                string parentColSql = $@"ALTER TABLE ""{tableName}""
+                             ADD COLUMN IF NOT EXISTS ""ParentId"" INTEGER REFERENCES ""{parentTable}""(Id);";
                 using var parentCmd = new NpgsqlCommand(parentColSql, conn);
                 await parentCmd.ExecuteNonQueryAsync();
             }
 
-            // Walk document fields
             foreach (var element in doc.Elements)
             {
                 string colName = SanitizeColumnName(element.Name);
 
                 if (element.Value.BsonType == BsonType.Array)
                 {
-                    string childTable = $"{tableName}_{colName}";
                     foreach (var item in element.Value.AsBsonArray)
                     {
                         if (item.BsonType == BsonType.Document)
                         {
+                            var childTable = GetTableName(element.Name);
                             await DiscoverSchemaAndCreateTablesAsync(conn, childTable, item.AsBsonDocument, tableName);
                         }
                         else
                         {
+                            var childTable = GetTableName(element.Name);
                             await EnsureScalarArrayTableExistsAsync(conn, childTable, tableName);
                         }
                     }
                 }
                 else if (element.Value.BsonType == BsonType.Document)
                 {
-                    string childTable = $"{tableName}_{colName}";
+                    var childTable = GetTableName(element.Name);
                     await DiscoverSchemaAndCreateTablesAsync(conn, childTable, element.Value.AsBsonDocument, tableName);
                 }
                 else
                 {
                     string colType = GetPostgresType(element.Value);
-                    string alterSql = $@"ALTER TABLE ""{tableName}"" 
-                                         ADD COLUMN IF NOT EXISTS ""{colName}"" {colType};";
+                    string alterSql = $@"ALTER TABLE ""{tableName}""
+                                     ADD COLUMN IF NOT EXISTS ""{colName}"" {colType};";
                     using var alterCmd = new NpgsqlCommand(alterSql, conn);
                     await alterCmd.ExecuteNonQueryAsync();
                 }
             }
         }
 
-        // 📝 Insert documents (recursively)
-        private async Task InsertDocumentAsync(NpgsqlConnection conn, string tableName, BsonDocument doc, string parentTable, int? parentId = null)
+        // 📝 Insert documents (recursive with FK)
+        private async Task InsertDocumentAsync(NpgsqlConnection conn, string tableName, BsonDocument doc, string? parentTable, int? parentId)
         {
             // Scalars only
             var scalarElements = doc.Elements.Where(e => e.Value.BsonType != BsonType.Array && e.Value.BsonType != BsonType.Document).ToList();
             var scalarCols = scalarElements.Select(e => SanitizeColumnName(e.Name)).ToList();
 
+            if (parentTable != null)
+                scalarCols.Insert(0, "ParentId");
+
             var colNames = string.Join(",", scalarCols.Select(c => $"\"{c}\""));
             var values = string.Join(",", scalarCols.Select((c, i) => $"@p{i}"));
 
-            if (parentTable != null) { colNames = "\"ParentId\"," + colNames; values = "@pid," + values; }
-
             var insertSql = $@"INSERT INTO ""{tableName}"" ({colNames}) VALUES ({values}) RETURNING Id;";
-
             using var cmd = new NpgsqlCommand(insertSql, conn);
 
             int i = 0;
+            if (parentTable != null && parentId.HasValue)
+            {
+                cmd.Parameters.AddWithValue($"p{i}", parentId.Value);
+                i++;
+            }
+
             foreach (var element in scalarElements)
             {
                 var converted = ConvertBsonValue(element.Value);
-                if (converted is Npgsql.NpgsqlParameter npgParam)
+                if (converted is NpgsqlParameter npgParam)
                 {
                     npgParam.ParameterName = $"p{i}";
                     cmd.Parameters.Add(npgParam);
@@ -150,19 +154,14 @@ namespace MongoToPostgresMigration
                 i++;
             }
 
-            if (parentTable != null)
-                cmd.Parameters.AddWithValue("pid", parentId ?? (object)DBNull.Value);
-
             var newId = (int)await cmd.ExecuteScalarAsync();
 
             // Handle arrays + nested docs
             foreach (var element in doc.Elements)
             {
-                string colName = SanitizeColumnName(element.Name);
-
                 if (element.Value.BsonType == BsonType.Array)
                 {
-                    string childTable = $"{tableName}_{colName}";
+                    string childTable = GetTableName(element.Name);
                     foreach (var item in element.Value.AsBsonArray)
                     {
                         if (item.BsonType == BsonType.Document)
@@ -171,6 +170,8 @@ namespace MongoToPostgresMigration
                         }
                         else
                         {
+                            await EnsureScalarArrayTableExistsAsync(conn, childTable, tableName);
+
                             var scalarInsert = $@"INSERT INTO ""{childTable}"" (""ParentId"", ""Value"") VALUES (@pid, @val);";
                             using var scalarCmd = new NpgsqlCommand(scalarInsert, conn);
                             scalarCmd.Parameters.AddWithValue("pid", newId);
@@ -181,13 +182,13 @@ namespace MongoToPostgresMigration
                 }
                 else if (element.Value.BsonType == BsonType.Document)
                 {
-                    string childTable = $"{tableName}_{colName}";
+                    string childTable = GetTableName(element.Name);
                     await InsertDocumentAsync(conn, childTable, element.Value.AsBsonDocument, tableName, newId);
                 }
             }
         }
 
-        // 🏗️ Helper: scalar array table
+        // 🏗️ Ensure scalar array tables exist
         private async Task EnsureScalarArrayTableExistsAsync(NpgsqlConnection conn, string tableName, string parentTable)
         {
             string createSql = $@"CREATE TABLE IF NOT EXISTS ""{tableName}"" (
@@ -196,19 +197,23 @@ namespace MongoToPostgresMigration
             using var cmd = new NpgsqlCommand(createSql, conn);
             await cmd.ExecuteNonQueryAsync();
 
-            string parentColSql = $@"ALTER TABLE ""{tableName}"" 
-                                     ADD COLUMN IF NOT EXISTS ""ParentId"" INTEGER REFERENCES ""{parentTable}""(Id);";
+            string parentColSql = $@"ALTER TABLE ""{tableName}""
+                             ADD COLUMN IF NOT EXISTS ""ParentId"" INTEGER REFERENCES ""{parentTable}""(Id);";
             using var parentCmd = new NpgsqlCommand(parentColSql, conn);
             await parentCmd.ExecuteNonQueryAsync();
 
-            string valueColSql = $@"ALTER TABLE ""{tableName}"" 
-                                    ADD COLUMN IF NOT EXISTS ""Value"" TEXT;";
+            string valueColSql = $@"ALTER TABLE ""{tableName}""
+                            ADD COLUMN IF NOT EXISTS ""Value"" TEXT;";
             using var valueCmd = new NpgsqlCommand(valueColSql, conn);
             await valueCmd.ExecuteNonQueryAsync();
         }
 
+        // 🛠 Helpers
         private string SanitizeColumnName(string name) =>
             name.Replace(".", "_").Replace(" ", "_").Replace("$", "dollar");
+
+        private string GetTableName(string name) =>
+            SanitizeColumnName(name);
 
         private string GetPostgresType(BsonValue value) =>
             value.BsonType switch
@@ -232,15 +237,15 @@ namespace MongoToPostgresMigration
                 BsonType.Double => value.AsDouble,
                 BsonType.Boolean => value.AsBoolean,
                 BsonType.DateTime => value.ToUniversalTime(),
-                BsonType.Document => new Npgsql.NpgsqlParameter
+                BsonType.Document => new NpgsqlParameter
                 {
                     Value = value.ToJson(),
-                    NpgsqlDbType = NpgsqlTypes.NpgsqlDbType.Jsonb
+                    NpgsqlDbType = NpgsqlDbType.Jsonb
                 },
-                BsonType.Array => new Npgsql.NpgsqlParameter
+                BsonType.Array => new NpgsqlParameter
                 {
                     Value = value.ToJson(),
-                    NpgsqlDbType = NpgsqlTypes.NpgsqlDbType.Jsonb
+                    NpgsqlDbType = NpgsqlDbType.Jsonb
                 },
                 _ => value.ToString()
             };
